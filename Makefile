@@ -36,6 +36,7 @@ help:
 	@echo "make apply-counts ARTICLE=<id>            # 既存ArticlesページにWordsカウント適用"
 	@echo "make unapply-counts ARTICLE=<id>          # 既存ArticlesページのWordsカウント減算"
 	@echo "make vocab-notes ARTICLE=<id>             # Geminiと語彙質問→VocabNotesへ保存"
+	@echo "  (例: make vocab-notes ARTICLE=<id> XLUNG=Japanese で指定言語の訳も追加)"
 	@echo "make setup-notion PARENT=<page_id>        # Articles/Patterns/Outputs DBを作成し.env更新"
 	@echo "make venv                                 # .venv 作成＆依存インストール"
 	@echo "----------------------------------------"
@@ -120,7 +121,7 @@ unapply-counts:
 
 vocab-notes:
 	@if [ -z "$(ARTICLE)" ]; then echo "❌ ARTICLE を指定してください: make vocab-notes ARTICLE=<page_id>"; exit 1; fi
-	@$(call RUNPY,$(SRC)/vocab_notes.py --article-id $(ARTICLE))
+	@$(call RUNPY,$(SRC)/vocab_notes.py --article-id $(ARTICLE) $(if $(strip $(or $(XLANG),$(XLUNG))),--extra-language "$(strip $(or $(XLANG),$(XLUNG)))") $(ARGS))
 
 # === Notion初期設置アップ ===
 setup-notion:

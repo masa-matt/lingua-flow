@@ -41,7 +41,16 @@ def get_article(article_id: str) -> tuple[str, str]:
     return title or article_id, body
 
 
-def explain_term(term: str, article_text: str) -> dict:
+def explain_term(term: str, article_text: str, extra_language: str | None = None) -> dict:
+    bilingual_note = ""
+    if extra_language:
+        bilingual_note = textwrap.dedent(
+            f"""
+            Additionally, include translations into {extra_language}:
+            - "term_local": the term translated or the closest common {extra_language} equivalent (one or two words)
+            - "meaning_local": one sentence definition translated into {extra_language}
+            """
+        ).strip()
     prompt = textwrap.dedent(
         f"""
         You are a vocabulary tutor for intermediate English learners.
@@ -56,6 +65,7 @@ def explain_term(term: str, article_text: str) -> dict:
         - "meaning": one sentence definition (CEFR B1)
         - "context": short phrase showing how it appears in context
         - "tip": brief memory tip or synonym
+        {bilingual_note}
         """
     ).strip()
     try:
@@ -77,18 +87,29 @@ def explain_term(term: str, article_text: str) -> dict:
         "meaning": data.get("meaning", "").strip(),
         "context": data.get("context", "").strip(),
         "tip": data.get("tip", "").strip(),
+        "meaning_local": data.get("meaning_local", "").strip(),
+        "term_local": data.get("term_local", "").strip(),
     }
     return output
 
 
-def format_notes(entries: list[dict]) -> str:
+def format_notes(entries: list[dict], extra_language: str | None = None) -> str:
     lines = []
     for item in entries:
         term = item.get("term") or "term"
         meaning = item.get("meaning") or ""
+        meaning_local = item.get("meaning_local") or ""
+        term_local = item.get("term_local") or ""
         context = item.get("context") or ""
         tip = item.get("tip") or ""
-        block = f"- **{term}**: {meaning}"
+        block = f"- **{term}**"
+        if term_local:
+            label = extra_language or "Other language"
+            block += f" ({label}: {term_local})"
+        block += f": {meaning}"
+        if meaning_local:
+            label = extra_language or "Other language"
+            block += f"\n    - {label}: {meaning_local}"
         if context:
             block += f"\n    - Context: {context}"
         if tip:
@@ -136,7 +157,12 @@ def main():
     parser = argparse.ArgumentParser(description="Vocabulary inquiry assistant")
     parser.add_argument("--article-id", required=True, help="Notion Articles page ID")
     parser.add_argument("--auto-save", action="store_true", help="空入力でも直ちに保存せず、確認してから保存")
+    parser.add_argument(
+        "--extra-language",
+        help="Optional language for translated meanings (e.g., Japanese)",
+    )
     args = parser.parse_args()
+    extra_language = (args.extra_language or "").strip()
 
     title, body = get_article(args.article_id)
     if not body:
@@ -150,12 +176,18 @@ def main():
         if not term:
             break
         try:
-            info = explain_term(term, body)
+            info = explain_term(term, body, extra_language=extra_language or None)
         except Exception as e:
             print(f"⚠️ 失敗: {e}")
             continue
         entries.append(info)
         print(f" {info['term']}: {info['meaning']}")
+        if info.get("term_local"):
+            label = extra_language or "Other language"
+            print(f"    term ({label}): {info['term_local']}")
+        if info.get("meaning_local"):
+            label = extra_language or "Other language"
+            print(f"    meaning ({label}): {info['meaning_local']}")
         if info.get("context"):
             print(f"    context: {info['context']}")
         if info.get("tip"):
@@ -165,7 +197,7 @@ def main():
         print("ノートはありません。終了します。")
         return
 
-    notes_text = format_notes(entries)
+    notes_text = format_notes(entries, extra_language=extra_language or None)
     print("\n=== Vocabulary Notes Preview ===")
     print(notes_text)
     if not args.auto_save:
