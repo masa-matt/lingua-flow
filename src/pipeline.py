@@ -1,4 +1,5 @@
 import os, re, json, time, argparse, math, uuid, collections, datetime, csv
+from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -24,17 +25,29 @@ gclient = genai.Client(api_key=GEMINI_API_KEY)
 
 def get(url, headers=None, params=None):
     r = requests.get(url, headers=headers or {}, params=params, timeout=30)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except requests.HTTPError:
+        print("[Notion API error]", r.text)
+        raise
     return r
 
 def post(url, headers=None, json=None, data=None):
     r = requests.post(url, headers=headers or {}, json=json, data=data, timeout=60)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except requests.HTTPError:
+        print("[Notion API error]", r.text)
+        raise
     return r
 
 def patch(url, headers=None, json=None):
     r = requests.patch(url, headers=headers or {}, json=json, timeout=60)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except requests.HTTPError:
+        print("[Notion API error]", r.text)
+        raise
     return r
 
 def slug(text, n=50):
@@ -45,26 +58,194 @@ def now_iso():
     # timezone-aware UTC（Python 3.11+）
     return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
 
+AD_CLASS_PAT = re.compile(
+    r"(advert|ads?|promo|sponsor|subscribe|newsletter|related|"
+    r"share|social|cookie|banner|signup|footer|header|nav|sidebar|outbrain|taboola)",
+    re.I,
+)
+AD_TEXT_PAT = re.compile(
+    r"(black\s*friday|buy\s*now|subscribe|sign\s*up|sponsored|deal(s)?|"
+    r"coupon|newsletter|shop|read\s*more|related\s*articles?)",
+    re.I,
+)
+BODY_SELECTORS = [
+    "article",
+    "[role=main]",
+    "main",
+    "[class*=entry-content]",
+    ".td-post-content",
+    ".post-content",
+    ".article-content",
+    ".story-content",
+    ".content-body",
+    ".c-article__body",
+    ".article-body",
+]
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _link_density(tag) -> float:
+    try:
+        text_len = len(tag.get_text(" ", strip=True))
+        if not text_len:
+            return 1.0
+        link_text = " ".join(a.get_text(" ", strip=True) for a in tag.find_all("a"))
+        return len(link_text) / max(text_len, 1)
+    except Exception:
+        return 1.0
+
+
+def _prune_noise(soup: BeautifulSoup):
+    for tag in soup.find_all(["script", "style", "noscript", "svg", "form", "iframe", "picture"]):
+        tag.decompose()
+    for tag in list(soup.find_all(True)):
+        classes = " ".join(tag.get("class", []))
+        tag_id = tag.get("id", "")
+        if AD_CLASS_PAT.search(classes) or AD_CLASS_PAT.search(tag_id) or AD_CLASS_PAT.search(tag.name):
+            tag.decompose()
+            continue
+        if _link_density(tag) > 0.5 and len(tag.get_text(" ", strip=True)) < 1200:
+            tag.decompose()
+
+
+def _jsonld_article(soup: BeautifulSoup) -> tuple[str | None, str | None]:
+    for ld in soup.find_all("script", type="application/ld+json"):
+        if not ld.string:
+            continue
+        try:
+            data = json.loads(ld.string)
+        except Exception:
+            continue
+        candidates = data if isinstance(data, list) else [data]
+        for obj in candidates:
+            if not isinstance(obj, dict):
+                continue
+            typ = obj.get("@type")
+            if not typ:
+                continue
+            types = (
+                {t.lower() for t in typ} if isinstance(typ, list) else {str(typ).lower()}
+            )
+            if not {"article", "newsarticle", "blogposting"} & types:
+                continue
+            body = obj.get("articleBody") or obj.get("description") or ""
+            title = obj.get("headline") or obj.get("name") or ""
+            if body and len(body) > 200:
+                return title.strip() if title else None, body.strip()
+    return None, None
+
+
+def _pick_best_block(blocks: list) -> str | None:
+    best_text = None
+    best_score = -1.0
+    for el in blocks:
+        txt = el.get_text(" ", strip=True)
+        if len(txt) < 200 or AD_TEXT_PAT.search(txt):
+            continue
+        density = _link_density(el)
+        score = len(txt) * (1.0 - min(density, 1.0))
+        if score > best_score:
+            best_score = score
+            best_text = txt
+    return best_text
+
+
+def _best_from_selectors(soup: BeautifulSoup) -> str | None:
+    blocks = []
+    for sel in BODY_SELECTORS:
+        blocks.extend(soup.select(sel))
+    return _pick_best_block(blocks)
+
+
+def _best_parent_block(soup: BeautifulSoup) -> str | None:
+    parents: dict = {}
+    for p in soup.find_all("p"):
+        parent = p.parent
+        parents[parent] = parents.get(parent, 0) + 1
+    candidates = sorted(parents.items(), key=lambda kv: kv[1], reverse=True)[:8]
+    best_parent = None
+    best_score = -1.0
+    for parent, _ in candidates:
+        txt = parent.get_text(" ", strip=True)
+        if len(txt) < 200 or AD_TEXT_PAT.search(txt):
+            continue
+        score = len(txt) * (1.0 - min(_link_density(parent), 1.0))
+        if score > best_score:
+            best_score = score
+            best_parent = parent
+    if best_parent:
+        return best_parent.get_text(" ", strip=True)
+    return None
+
+
+def _clean_lines(text: str) -> str:
+    lines = [ln.strip() for ln in re.split(r"[\r\n]+", text)]
+    lines = [ln for ln in lines if ln and not AD_TEXT_PAT.search(ln)]
+    return " ".join(lines)
+
+
+def _amp_candidate_url(soup: BeautifulSoup, base_url: str) -> str | None:
+    amp_link = soup.find("link", rel=lambda v: v and "amphtml" in v.lower())
+    if amp_link and amp_link.get("href"):
+        return urljoin(base_url, amp_link["href"])
+    if not base_url.endswith("/amp"):
+        return base_url.rstrip("/") + "/amp"
+    return None
+
+
+def _soup_title(soup: BeautifulSoup, fallback: str, url: str) -> str:
+    if soup and soup.find("h1"):
+        return soup.find("h1").get_text(" ", strip=True)
+    if soup and soup.title and soup.title.string:
+        return soup.title.string.strip()
+    return fallback or url
+
+
 # ====== 1) 記事本文抽出 ======
 def extract_article(url: str) -> dict:
-    html = get(url, headers={"User-Agent":"Mozilla/5.0"}).text
+    headers = {"User-Agent": "Mozilla/5.0"}
+    html = get(url, headers=headers).text
     soup = BeautifulSoup(html, "lxml")
+    fallback_title = (soup.title.string or "").strip() if soup.title and soup.title.string else url
 
-    # <article>優先、なければ本文候補を連結
-    candidates = []
-    for sel in ["article", "[role=main]", ".content", ".article-body", "#content", "main"]:
-        for tag in soup.select(sel):
-            candidates.append(tag.get_text(" ", strip=True))
-    if not candidates:
-        # 汎用：pタグ大量連結
-        ps = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-        candidates.append(" ".join(ps))
+    title_ld, body_ld = _jsonld_article(soup)
+    if body_ld and len(body_ld) > 300:
+        return {"title": title_ld or fallback_title, "body": _normalize_text(body_ld)}
 
-    text = max(candidates, key=len).strip()
-    title = soup.title.string.strip() if soup.title and soup.title.string else url
-    # 余計なホワイトスペース整理
-    text = re.sub(r"\s+", " ", text)
-    return {"title": title, "body": text}
+    amp_url = _amp_candidate_url(soup, url)
+    if amp_url:
+        try:
+            amp_html = get(amp_url, headers=headers).text
+            soup_amp = BeautifulSoup(amp_html, "lxml")
+            amp_title = (soup_amp.title.string or "").strip() if soup_amp.title and soup_amp.title.string else fallback_title
+            title_ld_amp, body_ld_amp = _jsonld_article(soup_amp)
+            if body_ld_amp and len(body_ld_amp) > 300:
+                return {
+                    "title": title_ld_amp or amp_title or fallback_title,
+                    "body": _normalize_text(body_ld_amp),
+                }
+            _prune_noise(soup_amp)
+            amp_text = _best_from_selectors(soup_amp) or _best_parent_block(soup_amp)
+            if amp_text:
+                cleaned = _normalize_text(_clean_lines(amp_text))
+                if len(cleaned) > 200:
+                    return {"title": _soup_title(soup_amp, fallback_title, url), "body": cleaned}
+        except Exception:
+            pass
+
+    _prune_noise(soup)
+    candidate_text = _best_from_selectors(soup) or _best_parent_block(soup)
+    if candidate_text:
+        cleaned = _normalize_text(_clean_lines(candidate_text))
+        if len(cleaned) > 200:
+            return {"title": _soup_title(soup, fallback_title, url), "body": cleaned}
+
+    body = " ".join(p.get_text(" ", strip=True) for p in soup.find_all("p"))
+    body = _normalize_text(body)
+    return {"title": fallback_title, "body": body}
 
 # ====== 2) GeminiでB1等へリライト＆語注 ======
 def _strip_md_fence(s: str) -> str:
