@@ -45,17 +45,17 @@ help:
 # 例: make input URL="https://www.coindesk.com/..." LEVEL=B1
 input:
 	@if [ -z "$(URL)" ]; then echo "❌ URL を指定してください: make input URL=<url> LEVEL=B1"; exit 1; fi
-	@$(call RUNPY,$(SRC)/pipeline.py --url "$(URL)" --level $(or $(LEVEL),B1))
+	@$(call RUNPY,$(SRC)/pipeline.py --url "$(URL)" --level $(or $(LEVEL),B1) $(ARGS))
 
 # 1〜4のみ実行してリライト本文をログ出力、保存/更新なし
 input-dry:
 	@if [ -z "$(URL)" ]; then echo "❌ URL を指定してください: make input-dry URL=<url> LEVEL=B1"; exit 1; fi
-	@$(call RUNPY,$(SRC)/pipeline.py --url "$(URL)" --level $(or $(LEVEL),B1) --dry-run-input)
+	@$(call RUNPY,$(SRC)/pipeline.py --url "$(URL)" --level $(or $(LEVEL),B1) --dry-run-input $(ARGS))
 
 # 6だけスキップ（1〜5は実行し、Words721カウント更新のみ行わない）
 input-no-countup:
 	@if [ -z "$(URL)" ]; then echo "❌ URL を指定してください: make input-no-countup URL=<url> LEVEL=B1"; exit 1; fi
-	@$(call RUNPY,$(SRC)/pipeline.py --url "$(URL)" --level $(or $(LEVEL),B1) --skip-word-count)
+	@$(call RUNPY,$(SRC)/pipeline.py --url "$(URL)" --level $(or $(LEVEL),B1) --skip-word-count $(ARGS))
 
 # === アウトプット支援（あなたが作文→Gemini添削→Outputs作成＆Words721加算） ===
 # 例: make output ARTICLE=2a5f436ffd0a8123456789abcdef

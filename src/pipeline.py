@@ -1,5 +1,5 @@
 import os, re, json, time, argparse, math, uuid, collections, datetime, csv
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -22,6 +22,14 @@ NOTION_VERSION   = os.getenv("NOTION_VERSION", "2022-06-28")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY が .env にありません。")
 gclient = genai.Client(api_key=GEMINI_API_KEY)
+
+MIN_ARTICLE_BODY_LEN = 200
+
+
+class ArticleExtractionError(RuntimeError):
+    def __init__(self, message: str, report: dict | None = None):
+        super().__init__(message)
+        self.report = report or {}
 
 def get(url, headers=None, params=None):
     r = requests.get(url, headers=headers or {}, params=params, timeout=30)
@@ -102,6 +110,8 @@ def _prune_noise(soup: BeautifulSoup):
     for tag in soup.find_all(["script", "style", "noscript", "svg", "form", "iframe", "picture"]):
         tag.decompose()
     for tag in list(soup.find_all(True)):
+        if getattr(tag, "attrs", None) is None:
+            continue
         classes = " ".join(tag.get("class", []))
         tag_id = tag.get("id", "")
         if AD_CLASS_PAT.search(classes) or AD_CLASS_PAT.search(tag_id) or AD_CLASS_PAT.search(tag.name):
@@ -138,7 +148,8 @@ def _jsonld_article(soup: BeautifulSoup) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _pick_best_block(blocks: list) -> str | None:
+def _pick_best_block(blocks: list):
+    best_el = None
     best_text = None
     best_score = -1.0
     for el in blocks:
@@ -150,24 +161,43 @@ def _pick_best_block(blocks: list) -> str | None:
         if score > best_score:
             best_score = score
             best_text = txt
+            best_el = el
+    return best_el, best_text, best_score
+
+
+def _best_from_selectors(soup: BeautifulSoup, capture_meta: bool = False):
+    blocks = []
+    selector_map = {}
+    for sel in BODY_SELECTORS:
+        found = soup.select(sel)
+        blocks.extend(found)
+        if capture_meta:
+            for el in found:
+                selector_map[id(el)] = sel
+    best_el, best_text, best_score = _pick_best_block(blocks)
+    if not best_el:
+        return (None, None) if capture_meta else None
+    if capture_meta:
+        meta = {
+            "selector": selector_map.get(id(best_el)),
+            "length": len(best_text or ""),
+            "score": round(best_score, 2) if best_score >= 0 else None,
+            "candidates": len(blocks),
+        }
+        return best_text, meta
     return best_text
 
 
-def _best_from_selectors(soup: BeautifulSoup) -> str | None:
-    blocks = []
-    for sel in BODY_SELECTORS:
-        blocks.extend(soup.select(sel))
-    return _pick_best_block(blocks)
-
-
-def _best_parent_block(soup: BeautifulSoup) -> str | None:
+def _best_parent_block(soup: BeautifulSoup, capture_meta: bool = False):
     parents: dict = {}
     for p in soup.find_all("p"):
         parent = p.parent
         parents[parent] = parents.get(parent, 0) + 1
     candidates = sorted(parents.items(), key=lambda kv: kv[1], reverse=True)[:8]
     best_parent = None
+    best_text = None
     best_score = -1.0
+    best_meta = None
     for parent, _ in candidates:
         txt = parent.get_text(" ", strip=True)
         if len(txt) < 200 or AD_TEXT_PAT.search(txt):
@@ -176,9 +206,17 @@ def _best_parent_block(soup: BeautifulSoup) -> str | None:
         if score > best_score:
             best_score = score
             best_parent = parent
+            best_text = txt
+            best_meta = {
+                "tag": parent.name,
+                "paragraphs": parents.get(parent, 0),
+                "score": round(score, 2),
+            }
     if best_parent:
-        return best_parent.get_text(" ", strip=True)
-    return None
+        if capture_meta:
+            return best_text, best_meta
+        return best_text
+    return (None, None) if capture_meta else None
 
 
 def _clean_lines(text: str) -> str:
@@ -196,6 +234,63 @@ def _amp_candidate_url(soup: BeautifulSoup, base_url: str) -> str | None:
     return None
 
 
+def _wordpress_rest_extract(url: str, headers: dict | None = None):
+    """
+    WordPressサイト向けフォールバック。
+    slug を元に /wp-json/wp/v2/posts?slug=... から本文を取得できるケースが多い。
+    """
+    headers = headers or {}
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    path = parsed.path.rstrip("/")
+    slug = path.split("/")[-1] if path else ""
+    if not slug:
+        return None
+    api_url = f"{parsed.scheme}://{parsed.netloc}/wp-json/wp/v2/posts"
+    try:
+        resp = requests.get(api_url, params={"slug": slug}, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    post = data[0]
+    title_html = (post.get("title") or {}).get("rendered") or ""
+    body_html = (post.get("content") or {}).get("rendered") or ""
+    soup_title = BeautifulSoup(title_html, "lxml")
+    soup_body = BeautifulSoup(body_html, "lxml")
+    title = soup_title.get_text(" ", strip=True) or post.get("slug") or slug
+    body = soup_body.get_text(" ", strip=True)
+    meta = {
+        "api_url": api_url,
+        "slug": slug,
+        "post_id": post.get("id"),
+    }
+    return title, body, meta
+
+
+def _print_extraction_report(report: dict | None):
+    if not report:
+        return
+    print("[extract-debug] extraction attempts for", report.get("url"))
+    for attempt in report.get("attempts", []):
+        step = attempt.get("step")
+        status = attempt.get("status")
+        detail = attempt.get("detail")
+        meta = {k: v for k, v in attempt.items() if k not in {"step", "status", "detail"}}
+        meta_str = ", ".join(f"{k}={v}" for k, v in meta.items() if v is not None)
+        suffix = ""
+        if detail:
+            suffix += f" - {detail}"
+        if meta_str:
+            suffix += f" ({meta_str})"
+        print(f"  - {step}: {status}{suffix}")
+    if report.get("final_status"):
+        print("  Result:", report["final_status"])
+
+
 def _soup_title(soup: BeautifulSoup, fallback: str, url: str) -> str:
     if soup and soup.find("h1"):
         return soup.find("h1").get_text(" ", strip=True)
@@ -205,47 +300,123 @@ def _soup_title(soup: BeautifulSoup, fallback: str, url: str) -> str:
 
 
 # ====== 1) 記事本文抽出 ======
-def extract_article(url: str) -> dict:
+def extract_article(url: str, debug: bool = False, min_length: int = MIN_ARTICLE_BODY_LEN) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
+    report = {"url": url, "min_length": min_length, "attempts": []}
+
+    def log(step: str, status: str, detail: str | None = None, **meta):
+        entry = {"step": step, "status": status}
+        if detail:
+            entry["detail"] = detail
+        for k, v in meta.items():
+            if v is not None:
+                entry[k] = v
+        report["attempts"].append(entry)
+
     html = get(url, headers=headers).text
+    log("fetch", "success", bytes=len(html))
     soup = BeautifulSoup(html, "lxml")
     fallback_title = (soup.title.string or "").strip() if soup.title and soup.title.string else url
 
     title_ld, body_ld = _jsonld_article(soup)
     if body_ld and len(body_ld) > 300:
-        return {"title": title_ld or fallback_title, "body": _normalize_text(body_ld)}
+        log("jsonld", "success", length=len(body_ld))
+        report["final_status"] = "success:jsonld"
+        result = {"title": title_ld or fallback_title, "body": _normalize_text(body_ld)}
+        if debug:
+            result["debug_report"] = report
+        return result
+    log("jsonld", "fail", length=len(body_ld or ""), detail="articleBody missing or too short")
 
     amp_url = _amp_candidate_url(soup, url)
     if amp_url:
+        log("amp", "candidate", url=amp_url)
         try:
             amp_html = get(amp_url, headers=headers).text
+            log("amp-fetch", "success", bytes=len(amp_html))
             soup_amp = BeautifulSoup(amp_html, "lxml")
             amp_title = (soup_amp.title.string or "").strip() if soup_amp.title and soup_amp.title.string else fallback_title
             title_ld_amp, body_ld_amp = _jsonld_article(soup_amp)
             if body_ld_amp and len(body_ld_amp) > 300:
-                return {
+                log("amp-jsonld", "success", length=len(body_ld_amp))
+                report["final_status"] = "success:amp-jsonld"
+                result = {
                     "title": title_ld_amp or amp_title or fallback_title,
                     "body": _normalize_text(body_ld_amp),
                 }
+                if debug:
+                    result["debug_report"] = report
+                return result
+            log("amp-jsonld", "fail", length=len(body_ld_amp or ""), detail="articleBody missing or too short")
             _prune_noise(soup_amp)
-            amp_text = _best_from_selectors(soup_amp) or _best_parent_block(soup_amp)
+            amp_text, amp_meta = _best_from_selectors(soup_amp, capture_meta=True)
+            if not amp_text:
+                amp_text, amp_meta = _best_parent_block(soup_amp, capture_meta=True)
             if amp_text:
                 cleaned = _normalize_text(_clean_lines(amp_text))
                 if len(cleaned) > 200:
-                    return {"title": _soup_title(soup_amp, fallback_title, url), "body": cleaned}
-        except Exception:
-            pass
+                    log("amp-body", "success", length=len(cleaned), **(amp_meta or {}))
+                    report["final_status"] = "success:amp-body"
+                    result = {"title": _soup_title(soup_amp, fallback_title, url), "body": cleaned}
+                    if debug:
+                        result["debug_report"] = report
+                    return result
+                log("amp-body", "fail", length=len(cleaned), detail="candidate too short", **(amp_meta or {}))
+        except Exception as exc:
+            log("amp", "error", detail=str(exc))
 
     _prune_noise(soup)
-    candidate_text = _best_from_selectors(soup) or _best_parent_block(soup)
+    candidate_text, candidate_meta = _best_from_selectors(soup, capture_meta=True)
+    if not candidate_text:
+        candidate_text, candidate_meta = _best_parent_block(soup, capture_meta=True)
     if candidate_text:
         cleaned = _normalize_text(_clean_lines(candidate_text))
         if len(cleaned) > 200:
-            return {"title": _soup_title(soup, fallback_title, url), "body": cleaned}
+            log("main-body", "success", length=len(cleaned), **(candidate_meta or {}))
+            report["final_status"] = "success:main-body"
+            result = {"title": _soup_title(soup, fallback_title, url), "body": cleaned}
+            if debug:
+                result["debug_report"] = report
+            return result
+        log("main-body", "fail", length=len(cleaned), detail="candidate too short", **(candidate_meta or {}))
 
-    body = " ".join(p.get_text(" ", strip=True) for p in soup.find_all("p"))
+    paragraphs = soup.find_all("p")
+    body = " ".join(p.get_text(" ", strip=True) for p in paragraphs)
     body = _normalize_text(body)
-    return {"title": fallback_title, "body": body}
+    log(
+        "paragraph-fallback",
+        "info",
+        paragraphs=len(paragraphs),
+        length=len(body),
+        detail="joined all <p> tags",
+    )
+    if len(body) >= min_length:
+        report["final_status"] = "success:paragraphs"
+        result = {"title": fallback_title, "body": body}
+        if debug:
+            result["debug_report"] = report
+        return result
+
+    wp = _wordpress_rest_extract(url, headers=headers)
+    if wp:
+        wp_title, wp_body, wp_meta = wp
+        cleaned_wp = _normalize_text(wp_body)
+        if len(cleaned_wp) >= min_length:
+            log("wordpress-api", "success", length=len(cleaned_wp), **(wp_meta or {}))
+            report["final_status"] = "success:wordpress-api"
+            result = {"title": wp_title or fallback_title, "body": cleaned_wp}
+            if debug:
+                result["debug_report"] = report
+            return result
+        log("wordpress-api", "fail", length=len(cleaned_wp), detail="response too short", **(wp_meta or {}))
+    else:
+        log("wordpress-api", "fail", detail="no slug match or API error")
+
+    report["final_status"] = "failed:min_length"
+    raise ArticleExtractionError(
+        f"記事本文の抽出に失敗しました（対応外フォーマットか、本文が {min_length} 文字未満）。",
+        report,
+    )
 
 # ====== 2) GeminiでB1等へリライト＆語注 ======
 def _strip_md_fence(s: str) -> str:
@@ -257,7 +428,9 @@ def _strip_md_fence(s: str) -> str:
             return parts[1].strip()
     return s
 
-def rewrite_with_gemini(raw_text: str, level: str = "B1") -> dict:
+def rewrite_with_gemini(raw_text: str, level: str = "B1", debug: bool = False) -> dict:
+    if debug:
+        print(f"[rewrite-debug] raw_text ({len(raw_text)} chars): {raw_text}")
     """
     google-genai SDK に“文字列プロンプト”で投げる（あなたの動作例と同じ方式）。
     返り値は JSON(dict) を期待。失敗時はフォールバックで {} を抽出。
@@ -733,6 +906,8 @@ def main():
                     help="既存のArticlesページIDについて、Wordsカウントを減算")
     ap.add_argument("--reset-words", choices=["zero","archive"],
                     help="Words をリセット。zero: カウンタ0化 / archive: 全ページをアーカイブ")
+    ap.add_argument("--extract-debug", action="store_true",
+                    help="記事抽出の詳細ログを表示（失敗時のヒント用）")
     args = ap.parse_args()
 
     # 明示カウント適用（単独モード）
@@ -758,11 +933,18 @@ def main():
     assert args.url, "--url が必要です"
 
     print("[1] 記事抽出中...")
-    art = extract_article(args.url)
+    try:
+        art = extract_article(args.url, debug=args.extract_debug)
+    except ArticleExtractionError as exc:
+        if args.extract_debug:
+            _print_extraction_report(getattr(exc, "report", None))
+        raise
+    if args.extract_debug:
+        _print_extraction_report(art.get("debug_report"))
     print("  Title:", art["title"][:80])
 
     print("[2] Geminiでリライト中...")
-    simp = rewrite_with_gemini(art["body"], level=args.level)
+    simp = rewrite_with_gemini(art["body"], level=args.level, debug=args.extract_debug)
     body = simp["body"]
     glossary = simp["glossary"]
 
@@ -836,4 +1018,7 @@ def main():
     print("Done. 音声ファイル:", mp3_path or "なし（省略）")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
