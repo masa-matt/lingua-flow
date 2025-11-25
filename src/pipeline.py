@@ -1,4 +1,4 @@
-import os, re, json, time, argparse, math, uuid, collections, datetime, csv
+import os, re, json, time, argparse, math, uuid, collections, datetime, csv, importlib.util
 from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
@@ -14,6 +14,30 @@ NOTION_TOKEN     = os.getenv("NOTION_TOKEN")
 ARTICLES_DB_ID   = os.getenv("ARTICLES_DB_ID")
 WORDS_DB_ID      = os.getenv("WORDS_DB_ID")
 NOTION_VERSION   = os.getenv("NOTION_VERSION", "2022-06-28")
+ELEVEN_LABS_API_KEY = os.getenv("ELEVEN_LABS_API_KEY")
+ELEVEN_LABS_VOICE_ID = os.getenv("ELEVEN_LABS_VOICE_ID") or "21m00Tcm4TlvDq8ikWAM"
+ELEVEN_LABS_MODEL_ID = os.getenv("ELEVEN_LABS_MODEL_ID", "eleven_multilingual_v2")
+ELEVEN_LABS_OUTPUT_FORMAT = os.getenv("ELEVEN_LABS_OUTPUT_FORMAT", "mp3_44100_128")
+TTS_ENGINE_DEFAULT = (os.getenv("TTS_ENGINE") or "auto").lower()
+COQUI_TTS_MODEL = os.getenv("COQUI_TTS_MODEL", "tts_models/en/vctk/vits")
+COQUI_TTS_SPEAKER = os.getenv("COQUI_TTS_SPEAKER")
+COQUI_TTS_LANGUAGE = os.getenv("COQUI_TTS_LANGUAGE")
+COQUI_TTS_STYLE = os.getenv("COQUI_TTS_STYLE")
+COQUI_TTS_DEVICE = os.getenv("COQUI_TTS_DEVICE")
+COQUI_TTS_COMPUTE_TYPE = os.getenv("COQUI_TTS_COMPUTE_TYPE")
+
+def _parse_float_env(name):
+    val = os.getenv(name)
+    if val is None or val.strip() == "":
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        print(f"[warn] {name} is not a float. Ignoring.")
+        return None
+
+ELEVEN_LABS_STABILITY = _parse_float_env("ELEVEN_LABS_STABILITY")
+ELEVEN_LABS_SIMILARITY = _parse_float_env("ELEVEN_LABS_SIMILARITY")
 
 # ====== ユーティリティ ======
 #
@@ -871,24 +895,149 @@ def unmark_counts_applied(page_id: str):
     except requests.HTTPError:
         pass
 
-# ====== 7) gTTSでローカル音声生成（任意） ======
-def synth_to_mp3(text: str, title: str, lang="en"):
+# ====== 7) 音声生成 ======
+def _coqui_module_available() -> bool:
+    """Check if the optional Coqui TTS dependency is importable."""
+    try:
+        return importlib.util.find_spec("TTS") is not None
+    except (ImportError, AttributeError):
+        return False
+
+
+def _resolve_tts_engine_chain(engine: str | None = None) -> list[str]:
+    valid = {"auto", "elevenlabs", "coqui", "gtts"}
+    choice = (engine or TTS_ENGINE_DEFAULT or "auto").lower()
+    if choice not in valid:
+        print(f"[warn] Unknown TTS engine '{choice}', falling back to auto.")
+        choice = "auto"
+    if choice != "auto":
+        return [choice]
+    chain: list[str] = []
+    if ELEVEN_LABS_API_KEY:
+        chain.append("elevenlabs")
+    if _coqui_module_available() and COQUI_TTS_MODEL:
+        chain.append("coqui")
+    chain.append("gtts")
+    return chain
+
+
+def generate_audio_file(text: str, title: str, lang="en", engine: str | None = None):
     """
     テキストを音声化し、outputディレクトリに保存。
-    ファイル名はスラッグ化したタイトル＋UUID短縮で一意に。
+    エンジン指定があれば優先し、autoのときは ElevenLabs → Coqui → gTTS の順で試行。
     """
-    from gtts import gTTS
     os.makedirs("output", exist_ok=True)
-    base = slug(title, n=60)
+    base = slug(title, n=60) or "article"
     uniq = uuid.uuid4().hex[:6]
     out_path = os.path.join("output", f"{base}-{uniq}.mp3")
-    try:
-        tts = gTTS(text=text, lang=lang)
-        tts.save(out_path)
-        return out_path
-    except Exception as e:
-        print(f"[warn] gTTS失敗: {e}")
-        return None
+
+    engines = _resolve_tts_engine_chain(engine)
+    last_error = None
+    for eng in engines:
+        try:
+            if eng == "elevenlabs":
+                return _synth_with_elevenlabs(text, out_path, lang=lang)
+            if eng == "coqui":
+                return _synth_with_coqui(text, out_path, lang=lang)
+            if eng == "gtts":
+                return _synth_with_gtts(text, out_path, lang=lang)
+        except Exception as e:
+            last_error = e
+            print(f"[warn] {eng} TTS failed: {e}")
+    if last_error:
+        print(f"[warn] 全エンジン失敗: {last_error}")
+    return None
+
+
+def _synth_with_elevenlabs(text: str, out_path: str, lang: str = "en") -> str:
+    if not ELEVEN_LABS_API_KEY:
+        raise RuntimeError("ELEVEN_LABS_API_KEY is missing.")
+    voice_id = ELEVEN_LABS_VOICE_ID or "21m00Tcm4TlvDq8ikWAM"
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "xi-api-key": ELEVEN_LABS_API_KEY,
+        "Accept": "audio/mpeg",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "text": text,
+        "model_id": ELEVEN_LABS_MODEL_ID,
+    }
+    if lang:
+        payload["language_code"] = lang
+    voice_settings = {}
+    if ELEVEN_LABS_STABILITY is not None:
+        voice_settings["stability"] = ELEVEN_LABS_STABILITY
+    if ELEVEN_LABS_SIMILARITY is not None:
+        voice_settings["similarity_boost"] = ELEVEN_LABS_SIMILARITY
+    if voice_settings:
+        payload["voice_settings"] = voice_settings
+    params = {"output_format": ELEVEN_LABS_OUTPUT_FORMAT}
+    resp = requests.post(url, headers=headers, params=params, json=payload, timeout=180)
+    resp.raise_for_status()
+    with open(out_path, "wb") as f:
+        f.write(resp.content)
+    return out_path
+
+
+_coqui_tts_instance = None
+_coqui_default_speaker = None
+
+
+def _synth_with_coqui(text: str, out_path: str, lang: str = "en") -> str:
+    """
+    Use Coqui TTS (https://github.com/coqui-ai/TTS) for local/offline synthesis.
+    The first call downloads the configured model and caches it under ~/.local/share/tts.
+    """
+    if not _coqui_module_available():
+        raise RuntimeError("TTS (Coqui) ライブラリがインストールされていません。")
+    from TTS.api import TTS as CoquiTTS  # lazy import to avoid overhead on non-Coqui runs
+
+    global _coqui_tts_instance, _coqui_default_speaker
+    if _coqui_tts_instance is None:
+        if not COQUI_TTS_MODEL:
+            raise RuntimeError("COQUI_TTS_MODEL が未設定です。")
+        tts_kwargs = {
+            "model_name": COQUI_TTS_MODEL,
+            "progress_bar": False,
+        }
+        if COQUI_TTS_DEVICE:
+            tts_kwargs["gpu"] = COQUI_TTS_DEVICE.lower().startswith("cuda")
+        if COQUI_TTS_COMPUTE_TYPE:
+            tts_kwargs["compute_type"] = COQUI_TTS_COMPUTE_TYPE
+        _coqui_tts_instance = CoquiTTS(**tts_kwargs)
+        if not COQUI_TTS_SPEAKER:
+            speakers = getattr(_coqui_tts_instance, "speakers", None)
+            if speakers:
+                _coqui_default_speaker = speakers[0]
+                print(f"[info] Coqui default speaker -> { _coqui_default_speaker } (override with COQUI_TTS_SPEAKER)")
+
+    synth_kwargs = {"file_path": out_path}
+    speaker = COQUI_TTS_SPEAKER or _coqui_default_speaker
+    if not speaker and getattr(_coqui_tts_instance, "speakers", None):
+        # 最後の砦：スピーカーリストがあるのに選択されていない場合、先頭を使う
+        _coqui_default_speaker = _coqui_tts_instance.speakers[0]
+        speaker = _coqui_default_speaker
+        print(f"[info] Coqui fallback speaker -> {speaker}")
+    if speaker:
+        synth_kwargs["speaker"] = speaker
+    style = COQUI_TTS_STYLE
+    if style:
+        synth_kwargs["style"] = style
+    language = COQUI_TTS_LANGUAGE
+    if language:
+        synth_kwargs["language"] = language
+
+    _coqui_tts_instance.tts_to_file(text=text, **synth_kwargs)
+    return out_path
+
+
+def _synth_with_gtts(text: str, out_path: str, lang: str = "en"):
+    from gtts import gTTS
+
+    tts = gTTS(text=text, lang=lang)
+    tts.save(out_path)
+    return out_path
 
 # ====== メイン ======
 def main():
@@ -908,6 +1057,12 @@ def main():
                     help="Words をリセット。zero: カウンタ0化 / archive: 全ページをアーカイブ")
     ap.add_argument("--extract-debug", action="store_true",
                     help="記事抽出の詳細ログを表示（失敗時のヒント用）")
+    ap.add_argument("--tts-article", metavar="ARTICLE_PAGE_ID",
+                    help="Notion Articlesページの本文を読み出して音声ファイルのみ生成")
+    ap.add_argument("--tts-text-file", metavar="TEXT_PATH",
+                    help="ローカルテキストファイルを音声化して終了")
+    ap.add_argument("--tts-engine", choices=["auto","elevenlabs","coqui","gtts"],
+                    help="音声エンジンを指定（未指定: 環境変数TTS_ENGINEまたはauto）")
     args = ap.parse_args()
 
     # 明示カウント適用（単独モード）
@@ -928,6 +1083,24 @@ def main():
     if args.seed:
         seed_words_csv(args.seed)
         print("Words seeded from CSV.")
+        return
+
+    if args.tts_article:
+        title, body = get_article_body(args.tts_article)
+        if not body:
+            raise RuntimeError(f"Body が空です（page_id={args.tts_article}）")
+        mp3_path = generate_audio_file(body, title=title, engine=args.tts_engine)
+        print(f"[tts] Generated audio from article {args.tts_article}: {mp3_path or '失敗'}")
+        return
+
+    if args.tts_text_file:
+        with open(args.tts_text_file) as f:
+            text = f.read().strip()
+        if not text:
+            raise RuntimeError(f"{args.tts_text_file} が空です")
+        title = os.path.splitext(os.path.basename(args.tts_text_file))[0] or "text"
+        mp3_path = generate_audio_file(text, title=title, engine=args.tts_engine)
+        print(f"[tts] Generated audio from file {args.tts_text_file}: {mp3_path or '失敗'}")
         return
 
     assert args.url, "--url が必要です"
@@ -992,7 +1165,7 @@ def main():
 
     print("[5] Notion(Articles)登録...")
     # 任意：音声作成（ローカル保存のみ）
-    mp3_path = synth_to_mp3(body, title=art["title"])
+    mp3_path = generate_audio_file(body, title=art["title"], engine=args.tts_engine)
     # audio_url は外部ホスティングURLがある場合に入れてね
     payload = build_articles_payload(
         title=art["title"], url=args.url, level=args.level,

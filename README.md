@@ -40,13 +40,41 @@ It allows you to process any article, simplify it to your target CEFR level, che
 ## 🚀 Quick Start
 
 ### 1. Requirements
-- Python 3.11+
+- **Python 3.11.x** (Coqui TTS does not yet support 3.12+)
 - Gemini API key and Notion integration token
-- `.env` file (see below)
+- `.env` file (copy from `.env.example` and fill in your values)
 
 ### 2. Setup
 ```bash
 make venv
 source .venv/bin/activate
-make seed-ngsl seed-nawl seed-spoken     # import wordlists into Notion
-make setup-notion PARENT=<notion_page_id> # auto-create Notion databases
+pip install -r requirements.txt            # Install Gemini / Notion / Coqui deps
+make seed-ngsl seed-nawl seed-spoken       # Import NGSL / NAWL / Spoken lists
+make setup-notion PARENT=<notion_page_id>  # Auto-create Notion databases
+cp .env.example .env && edit .env          # Add API keys & TTS preferences
+```
+
+Need to recreate just one database (e.g., Patterns only)? Add `ONLY=patterns` (comma-separated if multiple) when running `make setup-notion` to limit what gets created and written back into `.env`.
+
+---
+
+## 🔊 Text-to-Speech
+
+Audio files can be generated during article ingestion or via standalone commands. Select an engine via `TTS_ENGINE` in `.env` (see `.env.example`) or per command: `make ... TTS_ENGINE=<engine>`.
+
+| Engine | Description | What you need |
+| --- | --- | --- |
+| `elevenlabs` | Cloud synthesis via ElevenLabs API (highest quality) | Set `ELEVEN_LABS_API_KEY`, optionally tweak voice/model/stability |
+| `coqui` | Local OSS [TTS](https://github.com/coqui-ai/TTS) models | Python 3.11.x, `pip install -r requirements.txt`, **plus `espeak-ng` installed on your OS** |
+| `gtts` | Google Text-to-Speech fallback | No additional config |
+| `auto` | Tries `elevenlabs → coqui → gtts` in order | Default when `TTS_ENGINE` not specified |
+
+Common flows:
+
+```bash
+make input URL="https://example.com" LEVEL=B1
+make tts-article ARTICLE=<notion_page_id> TTS_ENGINE=coqui
+make tts-text FILE=notes.txt
+```
+
+> **Heads-up:** Coqui/phonemizer requires an `espeak` backend. Install it once on your system (e.g., `brew install espeak-ng` on macOS or `sudo apt install espeak-ng` on Ubuntu) before running `TTS_ENGINE=coqui`.

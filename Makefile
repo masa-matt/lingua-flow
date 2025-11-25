@@ -3,6 +3,8 @@ SHELL := /bin/bash
 PYTHON ?= python
 SRC     := src
 ENVFILE ?= .env
+TTS_ENGINE ?=
+TTS_ARGS := $(if $(strip $(TTS_ENGINE)),--tts-engine $(strip $(TTS_ENGINE)))
 
 # Helper: run a python module with .env exported (if present)
 define RUNPY
@@ -10,7 +12,7 @@ define RUNPY
 	$(PYTHON) $(1)
 endef
 
-.PHONY: help input output output-dry patterns patterns-dry seed-ngsl seed-nawl seed-spoken seed-all preview-ngsl csv-ngsl words-reset words-reset-all words-export words-summary apply-counts unapply-counts vocab-notes setup-notion venv
+.PHONY: help input input-dry input-no-countup output output-dry patterns patterns-dry seed-ngsl seed-nawl seed-spoken seed-all preview-ngsl csv-ngsl words-reset words-reset-all words-export words-summary apply-counts unapply-counts vocab-notes tts-article tts-text setup-notion venv
 
 help:
 	@echo ""
@@ -35,9 +37,12 @@ help:
 	@echo "make words-summary                        # リストごとの語数サマリ"
 	@echo "make apply-counts ARTICLE=<id>            # 既存ArticlesページにWordsカウント適用"
 	@echo "make unapply-counts ARTICLE=<id>          # 既存ArticlesページのWordsカウント減算"
+	@echo "make tts-article ARTICLE=<id>             # 既存Article本文から音声ファイル生成のみ"
+	@echo "make tts-text FILE=path/to/text.txt       # ローカルテキストを音声ファイルへ"
 	@echo "make vocab-notes ARTICLE=<id>             # Geminiと語彙質問→VocabNotesへ保存"
 	@echo "  (例: make vocab-notes ARTICLE=<id> XLUNG=Japanese で指定言語の訳も追加)"
-	@echo "make setup-notion PARENT=<page_id>        # Articles/Patterns/Outputs DBを作成し.env更新"
+	@echo "make setup-notion PARENT=<page_id> [ONLY=articles,patterns,outputs]"
+	@echo "                                          # Notion DBを作成（ONLY指定で部分更新）"
 	@echo "make venv                                 # .venv 作成＆依存インストール"
 	@echo "----------------------------------------"
 
@@ -45,17 +50,17 @@ help:
 # 例: make input URL="https://www.coindesk.com/..." LEVEL=B1
 input:
 	@if [ -z "$(URL)" ]; then echo "❌ URL を指定してください: make input URL=<url> LEVEL=B1"; exit 1; fi
-	@$(call RUNPY,$(SRC)/pipeline.py --url "$(URL)" --level $(or $(LEVEL),B1) $(ARGS))
+	@$(call RUNPY,$(SRC)/pipeline.py --url "$(URL)" --level $(or $(LEVEL),B1) $(TTS_ARGS) $(ARGS))
 
 # 1〜4のみ実行してリライト本文をログ出力、保存/更新なし
 input-dry:
 	@if [ -z "$(URL)" ]; then echo "❌ URL を指定してください: make input-dry URL=<url> LEVEL=B1"; exit 1; fi
-	@$(call RUNPY,$(SRC)/pipeline.py --url "$(URL)" --level $(or $(LEVEL),B1) --dry-run-input $(ARGS))
+	@$(call RUNPY,$(SRC)/pipeline.py --url "$(URL)" --level $(or $(LEVEL),B1) --dry-run-input $(TTS_ARGS) $(ARGS))
 
 # 6だけスキップ（1〜5は実行し、Words721カウント更新のみ行わない）
 input-no-countup:
 	@if [ -z "$(URL)" ]; then echo "❌ URL を指定してください: make input-no-countup URL=<url> LEVEL=B1"; exit 1; fi
-	@$(call RUNPY,$(SRC)/pipeline.py --url "$(URL)" --level $(or $(LEVEL),B1) --skip-word-count $(ARGS))
+	@$(call RUNPY,$(SRC)/pipeline.py --url "$(URL)" --level $(or $(LEVEL),B1) --skip-word-count $(TTS_ARGS) $(ARGS))
 
 # === アウトプット支援（あなたが作文→Gemini添削→Outputs作成＆Words721加算） ===
 # 例: make output ARTICLE=2a5f436ffd0a8123456789abcdef
@@ -113,20 +118,28 @@ words-summary:
 
 apply-counts:
 	@if [ -z "$(ARTICLE)" ]; then echo "❌ ARTICLE を指定してください: make apply-counts ARTICLE=<page_id>"; exit 1; fi
-	@$(call RUNPY,$(SRC)/pipeline.py --apply-counts $(ARTICLE))
+	@$(call RUNPY,$(SRC)/pipeline.py --apply-counts $(ARTICLE) $(TTS_ARGS))
 
 unapply-counts:
 	@if [ -z "$(ARTICLE)" ]; then echo "❌ ARTICLE を指定してください: make unapply-counts ARTICLE=<page_id>"; exit 1; fi
-	@$(call RUNPY,$(SRC)/pipeline.py --unapply-counts $(ARTICLE))
+	@$(call RUNPY,$(SRC)/pipeline.py --unapply-counts $(ARTICLE) $(TTS_ARGS))
 
 vocab-notes:
 	@if [ -z "$(ARTICLE)" ]; then echo "❌ ARTICLE を指定してください: make vocab-notes ARTICLE=<page_id>"; exit 1; fi
 	@$(call RUNPY,$(SRC)/vocab_notes.py --article-id $(ARTICLE) $(if $(strip $(or $(XLANG),$(XLUNG))),--extra-language "$(strip $(or $(XLANG),$(XLUNG)))") $(ARGS))
 
+tts-article:
+	@if [ -z "$(ARTICLE)" ]; then echo "❌ ARTICLE を指定してください: make tts-article ARTICLE=<page_id>"; exit 1; fi
+	@$(call RUNPY,$(SRC)/pipeline.py --tts-article $(ARTICLE) $(TTS_ARGS) $(ARGS))
+
+tts-text:
+	@if [ -z "$(FILE)" ]; then echo "❌ FILE を指定してください: make tts-text FILE=path/to/text.txt"; exit 1; fi
+	@$(call RUNPY,$(SRC)/pipeline.py --tts-text-file "$(FILE)" $(TTS_ARGS) $(ARGS))
+
 # === Notion初期設置アップ ===
 setup-notion:
 	@if [ -z "$(PARENT)" ]; then echo "❌ PARENT を指定してください: make setup-notion PARENT=<page_id>"; exit 1; fi
-	@$(call RUNPY,$(SRC)/setup_notion.py --parent-id $(PARENT) --env-file $(ENVFILE))
+	@$(call RUNPY,$(SRC)/setup_notion.py --parent-id $(PARENT) --env-file $(ENVFILE) $(if $(strip $(ONLY)),--only $(strip $(ONLY))))
 
 # === 仮想環境セットアップ ===
 # 例: make venv
